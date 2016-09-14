@@ -4,4 +4,5 @@ build:
 run:
 	go run *.go
 
-
+clean:
+	rm hot-links
