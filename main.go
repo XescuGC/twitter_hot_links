@@ -11,6 +11,8 @@ import (
 	"github.com/dghubble/oauth1"
 )
 
+var urls = make(map[string]int)
+
 func main() {
 	config := readConfig()
 	stream := openTwitterStream(config)
@@ -28,6 +30,7 @@ func attachMessageHandlers(stream *twitter.Stream) {
 			fmt.Println(tweet.Text)
 			for _, url := range tweet.Entities.Urls {
 				fmt.Printf("- %#v\n", url.ExpandedURL)
+				urls[url.ExpandedURL]++
 			}
 			fmt.Println("---")
 		}
@@ -66,4 +69,13 @@ func keepRunning(stream *twitter.Stream) {
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	log.Println(<-ch)
 	stream.Stop()
+	showCollectedData()
+}
+
+func showCollectedData() {
+	for k, v := range urls {
+		if v > 1 {
+			fmt.Printf("%s: %d\n", k, v)
+		}
+	}
 }
