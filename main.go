@@ -100,7 +100,10 @@ func showCollectedData() {
 		}
 	}
 	sort.Sort(UrlsByScore(urlsByScore))
-	for _, v := range urlsByScore {
+	for i, v := range urlsByScore {
+		if i == 100 {
+			break
+		}
 		fmt.Printf("%f %d %s\n", v.score, v.count, v.url)
 	}
 }
