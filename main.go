@@ -3,22 +3,54 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
+	"time"
 
 	"github.com/dghubble/go-twitter/twitter"
 	"github.com/dghubble/oauth1"
 )
 
-var urls = make(map[string]int)
+type url struct {
+	count   int
+	created time.Time
+	score   float64
+	url     string
+}
+
+type UrlsByScore []url
+
+func (u UrlsByScore) Len() int           { return len(u) }
+func (u UrlsByScore) Swap(i, j int)      { u[i], u[j] = u[j], u[i] }
+func (u UrlsByScore) Less(i, j int) bool { return u[i].score > u[j].score }
+
+var urls = make(map[string]*url)
 
 func main() {
 	config := readConfig()
 	stream := openTwitterStream(config)
 
+	tickChan := time.NewTicker(time.Minute * 1).C
+	signalChannel := make(chan os.Signal)
+	signal.Notify(signalChannel, syscall.SIGINT, syscall.SIGTERM)
+
 	attachMessageHandlers(stream)
-	keepRunning(stream)
+
+	for {
+		select {
+		case <-signalChannel:
+			fmt.Println("Stoping ...")
+			stream.Stop()
+			showCollectedData()
+			return
+		case <-tickChan:
+			fmt.Println("Printing state ...")
+			showCollectedData()
+		}
+	}
 }
 
 // Set twitter stream handlers
@@ -26,22 +58,17 @@ func attachMessageHandlers(stream *twitter.Stream) {
 	demux := twitter.NewSwitchDemux()
 
 	demux.Tweet = func(tweet *twitter.Tweet) {
-		if len(tweet.Entities.Urls) != 0 {
-			fmt.Println(tweet.Text)
-			for _, url := range tweet.Entities.Urls {
-				fmt.Printf("- %#v\n", url.ExpandedURL)
-				urls[url.ExpandedURL]++
+		if tweet.Entities != nil && len(tweet.Entities.Urls) != 0 {
+			for _, u := range tweet.Entities.Urls {
+				if val, ok := urls[u.ExpandedURL]; ok {
+					val.count++
+				} else {
+					urls[u.ExpandedURL] = &url{count: 0, created: time.Now(), url: u.ExpandedURL}
+				}
 			}
-			fmt.Println("---")
 		}
 	}
 
-	//demux.StreamDisconnect = func(disconnect *twitter.StreamDisconnect) {
-	//}
-	//demux.StallWarning = func(warning *twitter.StallWarning) {
-	//}
-
-	// Receive messages until stopped or stream quits
 	go demux.HandleChan(stream.Messages)
 }
 
@@ -63,19 +90,17 @@ func openTwitterStream(config Config) *twitter.Stream {
 	return stream
 }
 
-// Wait for SIGINT and SIGTERM (HIT CTRL-C)
-func keepRunning(stream *twitter.Stream) {
-	ch := make(chan os.Signal)
-	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-	log.Println(<-ch)
-	stream.Stop()
-	showCollectedData()
-}
-
 func showCollectedData() {
-	for k, v := range urls {
-		if v > 1 {
-			fmt.Printf("%s: %d\n", k, v)
+	urlsByScore := make([]url, 1)
+	for _, v := range urls {
+		if v.count > 1 {
+			power := math.Pow(time.Now().Sub(v.created).Minutes(), 1.8)
+			v.score = float64(v.count) / power
+			urlsByScore = append(urlsByScore, *v)
 		}
+	}
+	sort.Sort(UrlsByScore(urlsByScore))
+	for _, v := range urlsByScore {
+		fmt.Printf("%f %d %s\n", v.score, v.count, v.url)
 	}
 }
