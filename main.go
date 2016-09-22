@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"os"
 	"os/signal"
 	"sort"
@@ -21,6 +22,15 @@ type url struct {
 	url     string
 }
 
+type urlFetch struct {
+	url     string
+	fetched bool
+}
+
+func NewUrlFetch(url string) *urlFetch {
+	return &urlFetch{url: url, fetched: false}
+}
+
 type UrlsByScore []url
 
 func (u UrlsByScore) Len() int           { return len(u) }
@@ -28,6 +38,10 @@ func (u UrlsByScore) Swap(i, j int)      { u[i], u[j] = u[j], u[i] }
 func (u UrlsByScore) Less(i, j int) bool { return u[i].score > u[j].score }
 
 var urls = make(map[string]*url)
+var timeout = time.Duration(10 * time.Second)
+var client = http.Client{
+	Timeout: timeout,
+}
 
 func main() {
 	config := readConfig()
@@ -35,9 +49,10 @@ func main() {
 
 	tickChan := time.NewTicker(time.Minute * 1).C
 	signalChannel := make(chan os.Signal)
+	tweetChannel := make(chan *urlFetch)
 	signal.Notify(signalChannel, syscall.SIGINT, syscall.SIGTERM)
 
-	attachMessageHandlers(stream)
+	attachMessageHandlers(stream, tweetChannel)
 
 	for {
 		select {
@@ -45,7 +60,15 @@ func main() {
 			fmt.Println("Stoping ...")
 			stream.Stop()
 			showCollectedData()
+			//close(tickChan)
+			close(tweetChannel)
 			return
+		case t := <-tweetChannel:
+			if t.fetched {
+				storeTweet(t)
+			} else {
+				go fetch(t, tweetChannel)
+			}
 		case <-tickChan:
 			fmt.Println("Printing state ...")
 			showCollectedData()
@@ -53,18 +76,40 @@ func main() {
 	}
 }
 
+func fetch(t *urlFetch, c chan *urlFetch) {
+	resp, err := client.Get(t.url)
+	if err != nil {
+		//panic(err)
+		fmt.Printf("http.Get => %v\n", err.Error())
+	} else {
+
+		t.url = resp.Request.URL.String()
+		//fmt.Println(t.url)
+		t.fetched = true
+		c <- t
+	}
+}
+
+func storeTweet(t *urlFetch) {
+	//fmt.Println("Storeing: %#v", t.url)
+	if val, ok := urls[t.url]; ok {
+		val.count++
+	} else {
+		urls[t.url] = &url{count: 0, created: time.Now(), url: t.url}
+	}
+}
+
 // Set twitter stream handlers
-func attachMessageHandlers(stream *twitter.Stream) {
+func attachMessageHandlers(stream *twitter.Stream, c chan *urlFetch) {
 	demux := twitter.NewSwitchDemux()
 
 	demux.Tweet = func(tweet *twitter.Tweet) {
+		//fmt.Println("in")
 		if tweet.Entities != nil && len(tweet.Entities.Urls) != 0 {
 			for _, u := range tweet.Entities.Urls {
-				if val, ok := urls[u.ExpandedURL]; ok {
-					val.count++
-				} else {
-					urls[u.ExpandedURL] = &url{count: 0, created: time.Now(), url: u.ExpandedURL}
-				}
+				//fmt.Println("Twitter url %#v", u.URL)
+				//stringUrl, _ := u.(string)
+				c <- NewUrlFetch(u.ExpandedURL)
 			}
 		}
 	}
