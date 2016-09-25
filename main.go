@@ -11,8 +11,11 @@ import (
 	"syscall"
 	"time"
 
+	"./config"
+	"./schema"
 	"github.com/dghubble/go-twitter/twitter"
 	"github.com/dghubble/oauth1"
+	"github.com/golang/groupcache/lru"
 )
 
 type url struct {
@@ -20,6 +23,11 @@ type url struct {
 	created time.Time
 	score   float64
 	url     string
+}
+
+func (u *url) CalculateScore() {
+	power := math.Pow(time.Now().Sub(u.created).Minutes(), 1.8)
+	u.score = float64(u.count) / power
 }
 
 type urlFetch struct {
@@ -37,17 +45,20 @@ func (u UrlsByScore) Len() int           { return len(u) }
 func (u UrlsByScore) Swap(i, j int)      { u[i], u[j] = u[j], u[i] }
 func (u UrlsByScore) Less(i, j int) bool { return u[i].score > u[j].score }
 
-var urls = make(map[string]*url)
-var timeout = time.Duration(10 * time.Second)
-var client = http.Client{
-	Timeout: timeout,
-}
+var (
+	urls    = make(map[string]*url)
+	timeout = time.Duration(10 * time.Second)
+	client  = http.Client{
+		Timeout: timeout,
+	}
+	cache = lru.New(300)
+)
 
 func main() {
-	config := readConfig()
-	stream := openTwitterStream(config)
+	stream := openTwitterStream()
 
 	tickChan := time.NewTicker(time.Minute * 1).C
+	flushChan := time.NewTicker(time.Minute * 1).C
 	signalChannel := make(chan os.Signal)
 	tweetChannel := make(chan *urlFetch)
 	signal.Notify(signalChannel, syscall.SIGINT, syscall.SIGTERM)
@@ -56,6 +67,9 @@ func main() {
 
 	for {
 		select {
+		case <-flushChan:
+			fmt.Println("Flushing ...")
+			go flush()
 		case <-signalChannel:
 			fmt.Println("Stoping ...")
 			stream.Stop()
@@ -64,7 +78,7 @@ func main() {
 			close(tweetChannel)
 			return
 		case t := <-tweetChannel:
-			if t.fetched {
+			if _, ok := urls[t.url]; ok || t.fetched {
 				storeTweet(t)
 			} else {
 				go fetch(t, tweetChannel)
@@ -76,22 +90,42 @@ func main() {
 	}
 }
 
-func fetch(t *urlFetch, c chan *urlFetch) {
-	resp, err := client.Get(t.url)
-	if err != nil {
-		//panic(err)
-		fmt.Printf("http.Get => %v\n", err.Error())
-	} else {
+func flush() {
+	for _, v := range urls {
+		v.CalculateScore()
+		t := schema.NewTweetUrl(v.url, v.count, v.created, v.score)
+		err := t.Save()
+		if err != nil {
+			panic(err)
+		}
+	}
+}
 
-		t.url = resp.Request.URL.String()
-		//fmt.Println(t.url)
+func fetch(t *urlFetch, c chan *urlFetch) {
+	defer func() {
+		if t.fetched {
+			c <- t
+		}
+	}()
+	if value, ok := cache.Get(t.url); ok {
+		u := value.(string)
+		t.url = u
 		t.fetched = true
-		c <- t
+	} else {
+		resp, err := client.Get(t.url)
+		if err != nil {
+			fmt.Printf("http.Get => %v\n", err.Error())
+		} else {
+			defer resp.Body.Close() // It fixes an error with http
+			u := resp.Request.URL.String()
+			cache.Add(t.url, u)
+			t.fetched = true
+			t.url = u
+		}
 	}
 }
 
 func storeTweet(t *urlFetch) {
-	//fmt.Println("Storeing: %#v", t.url)
 	if val, ok := urls[t.url]; ok {
 		val.count++
 	} else {
@@ -104,11 +138,8 @@ func attachMessageHandlers(stream *twitter.Stream, c chan *urlFetch) {
 	demux := twitter.NewSwitchDemux()
 
 	demux.Tweet = func(tweet *twitter.Tweet) {
-		//fmt.Println("in")
 		if tweet.Entities != nil && len(tweet.Entities.Urls) != 0 {
 			for _, u := range tweet.Entities.Urls {
-				//fmt.Println("Twitter url %#v", u.URL)
-				//stringUrl, _ := u.(string)
 				c <- NewUrlFetch(u.ExpandedURL)
 			}
 		}
@@ -117,9 +148,10 @@ func attachMessageHandlers(stream *twitter.Stream, c chan *urlFetch) {
 	go demux.HandleChan(stream.Messages)
 }
 
-func openTwitterStream(config Config) *twitter.Stream {
-	oauthConfig := oauth1.NewConfig(config.ConsumerKey, config.ConsumerSecret)
-	token := oauth1.NewToken(config.AccessToken, config.AccessSecret)
+func openTwitterStream() *twitter.Stream {
+	c := config.Twitter
+	oauthConfig := oauth1.NewConfig(c.ConsumerKey, c.ConsumerSecret)
+	token := oauth1.NewToken(c.AccessToken, c.AccessSecret)
 	httpClient := oauthConfig.Client(oauth1.NoContext, token)
 	client := twitter.NewClient(httpClient)
 
@@ -135,15 +167,19 @@ func openTwitterStream(config Config) *twitter.Stream {
 	return stream
 }
 
-func showCollectedData() {
+func scoreUrls() []url {
 	urlsByScore := make([]url, 1)
 	for _, v := range urls {
 		if v.count > 1 {
-			power := math.Pow(time.Now().Sub(v.created).Minutes(), 1.8)
-			v.score = float64(v.count) / power
+			v.CalculateScore()
 			urlsByScore = append(urlsByScore, *v)
 		}
 	}
+	return urlsByScore
+}
+
+func showCollectedData() {
+	urlsByScore := scoreUrls()
 	sort.Sort(UrlsByScore(urlsByScore))
 	for i, v := range urlsByScore {
 		if i == 100 {
