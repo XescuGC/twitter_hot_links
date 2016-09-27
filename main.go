@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,11 +48,13 @@ func (u UrlsByScore) Less(i, j int) bool { return u[i].score > u[j].score }
 
 var (
 	urls    = make(map[string]*url)
-	timeout = time.Duration(10 * time.Second)
+	timeout = time.Duration(30 * time.Second)
 	client  = http.Client{
 		Timeout: timeout,
 	}
-	cache = lru.New(300)
+	cache          = lru.New(300)
+	numberOfWokers = 100
+	mutex          = &sync.Mutex{}
 )
 
 func main() {
@@ -61,9 +64,14 @@ func main() {
 	flushChan := time.NewTicker(time.Minute * 1).C
 	signalChannel := make(chan os.Signal)
 	tweetChannel := make(chan *urlFetch)
+	jobsChannel := make(chan *urlFetch)
 	signal.Notify(signalChannel, syscall.SIGINT, syscall.SIGTERM)
 
 	attachMessageHandlers(stream, tweetChannel)
+
+	for i := 1; i < numberOfWokers; i++ {
+		go fetch(jobsChannel, tweetChannel)
+	}
 
 	for {
 		select {
@@ -81,7 +89,7 @@ func main() {
 			if _, ok := urls[t.url]; ok || t.fetched {
 				storeTweet(t)
 			} else {
-				go fetch(t, tweetChannel)
+				go func() { jobsChannel <- t }()
 			}
 		case <-tickChan:
 			fmt.Println("Printing state ...")
@@ -101,26 +109,30 @@ func flush() {
 	}
 }
 
-func fetch(t *urlFetch, c chan *urlFetch) {
-	defer func() {
-		if t.fetched {
-			c <- t
-		}
-	}()
-	if value, ok := cache.Get(t.url); ok {
-		u := value.(string)
-		t.url = u
-		t.fetched = true
-	} else {
-		resp, err := client.Get(t.url)
-		if err != nil {
-			fmt.Printf("http.Get => %v\n", err.Error())
+func fetch(jobs <-chan *urlFetch, c chan<- *urlFetch) {
+	for j := range jobs {
+		mutex.Lock()
+		value, ok := cache.Get(j.url)
+		mutex.Unlock()
+		if ok {
+			u := value.(string)
+			j.url = u
+			j.fetched = true
+			c <- j
 		} else {
-			defer resp.Body.Close() // It fixes an error with http
-			u := resp.Request.URL.String()
-			cache.Add(t.url, u)
-			t.fetched = true
-			t.url = u
+			resp, err := client.Get(j.url)
+			if err != nil {
+				fmt.Printf("http.Get => %v\n", err.Error())
+			} else {
+				defer resp.Body.Close() // Ij fixes an error wijh hjjp
+				u := resp.Request.URL.String()
+				mutex.Lock()
+				cache.Add(j.url, u)
+				mutex.Unlock()
+				j.fetched = true
+				j.url = u
+				c <- j
+			}
 		}
 	}
 }
