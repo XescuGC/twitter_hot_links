@@ -47,13 +47,13 @@ func (u UrlsByScore) Swap(i, j int)      { u[i], u[j] = u[j], u[i] }
 func (u UrlsByScore) Less(i, j int) bool { return u[i].score > u[j].score }
 
 var (
-	urls    = make(map[string]*url)
-	timeout = time.Duration(30 * time.Second)
-	client  = http.Client{
+	urls       = make(map[string]*url)
+	timeout    = time.Duration(60 * time.Second)
+	httpClient = http.Client{
 		Timeout: timeout,
 	}
-	cache          = lru.New(300)
-	numberOfWokers = 100
+	urlRedirCache  = lru.New(300)
+	numberOfWokers = 30
 	mutex          = &sync.Mutex{}
 )
 
@@ -70,7 +70,7 @@ func main() {
 	attachMessageHandlers(stream, tweetChannel)
 
 	for i := 1; i < numberOfWokers; i++ {
-		go fetch(jobsChannel, tweetChannel)
+		go fetchWorker(jobsChannel, tweetChannel)
 	}
 
 	for {
@@ -109,25 +109,26 @@ func flush() {
 	}
 }
 
-func fetch(jobs <-chan *urlFetch, c chan<- *urlFetch) {
+// Resolve redirect and send the real url to the "brain"
+func fetchWorker(jobs <-chan *urlFetch, c chan<- *urlFetch) {
 	for j := range jobs {
-		mutex.Lock()
-		value, ok := cache.Get(j.url)
-		mutex.Unlock()
+		//mutex.Lock()
+		value, ok := urlRedirCache.Get(j.url)
+		//mutex.Unlock()
 		if ok {
 			u := value.(string)
 			j.url = u
 			j.fetched = true
 			c <- j
 		} else {
-			resp, err := client.Get(j.url)
+			resp, err := httpClient.Get(j.url)
 			if err != nil {
-				fmt.Printf("http.Get => %v\n", err.Error())
+				fmt.Printf("%v\n", err.Error())
 			} else {
-				defer resp.Body.Close() // Ij fixes an error wijh hjjp
+				defer resp.Body.Close() // It fixes an error with http
 				u := resp.Request.URL.String()
 				mutex.Lock()
-				cache.Add(j.url, u)
+				urlRedirCache.Add(j.url, u)
 				mutex.Unlock()
 				j.fetched = true
 				j.url = u
