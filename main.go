@@ -1,53 +1,24 @@
 package main
 
 import (
-	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"os"
 	"os/signal"
-	"sort"
 	"sync"
 	"syscall"
 	"time"
 
+	"./brain"
 	"./config"
+	"./logger"
 	"./schema"
 	"github.com/dghubble/go-twitter/twitter"
 	"github.com/dghubble/oauth1"
 	"github.com/golang/groupcache/lru"
 )
 
-type url struct {
-	count   int
-	created time.Time
-	score   float64
-	url     string
-}
-
-func (u *url) CalculateScore() {
-	power := math.Pow(time.Now().Sub(u.created).Minutes(), 1.8)
-	u.score = float64(u.count) / power
-}
-
-type urlFetch struct {
-	url     string
-	fetched bool
-}
-
-func NewUrlFetch(url string) *urlFetch {
-	return &urlFetch{url: url, fetched: false}
-}
-
-type UrlsByScore []url
-
-func (u UrlsByScore) Len() int           { return len(u) }
-func (u UrlsByScore) Swap(i, j int)      { u[i], u[j] = u[j], u[i] }
-func (u UrlsByScore) Less(i, j int) bool { return u[i].score > u[j].score }
-
 var (
-	urls       = make(map[string]*url)
 	timeout    = time.Duration(60 * time.Second)
 	httpClient = http.Client{
 		Timeout: timeout,
@@ -58,50 +29,57 @@ var (
 )
 
 func main() {
-	stream := openTwitterStream()
+	logFile := logger.NewLogFile("hot-links.log")
+	streamLog := logFile.WithNamespace("Stream")
+	brainLog := logFile.WithNamespace("Brain")
+	resolverLog := logFile.WithNamespace("Resolver")
+	storeLog := logFile.WithNamespace("Store")
+
+	stream := openTwitterStream(streamLog)
 
 	tickChan := time.NewTicker(time.Minute * 1).C
-	flushChan := time.NewTicker(time.Minute * 1).C
+	storeChan := time.NewTicker(time.Minute * 5).C
 	signalChannel := make(chan os.Signal)
-	tweetChannel := make(chan *urlFetch)
-	jobsChannel := make(chan *urlFetch)
+	tweetChannel := make(chan *brain.UrlFetch)
+	jobsChannel := make(chan *brain.UrlFetch)
 	signal.Notify(signalChannel, syscall.SIGINT, syscall.SIGTERM)
 
 	attachMessageHandlers(stream, tweetChannel)
 
 	for i := 1; i < numberOfWokers; i++ {
-		go fetchWorker(jobsChannel, tweetChannel)
+		go fetchWorker(jobsChannel, tweetChannel, resolverLog)
 	}
 
 	for {
 		select {
-		case <-flushChan:
-			fmt.Println("Flushing ...")
-			go flush()
-		case <-signalChannel:
-			fmt.Println("Stoping ...")
-			stream.Stop()
-			showCollectedData()
-			//close(tickChan)
-			close(tweetChannel)
-			return
+		case <-storeChan:
+			go flush(storeLog)
+
 		case t := <-tweetChannel:
-			if _, ok := urls[t.url]; ok || t.fetched {
-				storeTweet(t)
+			if t.Fetched || brain.Knows(t.Url) {
+				brain.Store(t)
 			} else {
 				go func() { jobsChannel <- t }()
 			}
+
 		case <-tickChan:
-			fmt.Println("Printing state ...")
-			showCollectedData()
+			brain.Dump(brainLog)
+
+		case <-signalChannel:
+			log.Println("Stoping ...")
+			stream.Stop()
+			//Ensure to save brain state
+			close(tweetChannel)
+			return
 		}
 	}
 }
 
-func flush() {
-	for _, v := range urls {
+func flush(log *log.Logger) {
+	log.Println("Storing...")
+	for _, v := range brain.Urls() {
 		v.CalculateScore()
-		t := schema.NewTweetUrl(v.url, v.count, v.created, v.score)
+		t := schema.NewTweetUrl(v.Url, v.Count, v.Created, v.Score)
 		err := t.Save()
 		if err != nil {
 			panic(err)
@@ -110,50 +88,42 @@ func flush() {
 }
 
 // Resolve redirect and send the real url to the "brain"
-func fetchWorker(jobs <-chan *urlFetch, c chan<- *urlFetch) {
+func fetchWorker(jobs <-chan *brain.UrlFetch, c chan<- *brain.UrlFetch, log *log.Logger) {
 	for j := range jobs {
 		//mutex.Lock()
-		value, ok := urlRedirCache.Get(j.url)
+		value, ok := urlRedirCache.Get(j.Url)
 		//mutex.Unlock()
 		if ok {
 			u := value.(string)
-			j.url = u
-			j.fetched = true
+			j.Url = u
+			j.Fetched = true
 			c <- j
 		} else {
-			resp, err := httpClient.Get(j.url)
+			resp, err := httpClient.Get(j.Url)
 			if err != nil {
-				fmt.Printf("%v\n", err.Error())
+				log.Printf("%v\n", err.Error())
 			} else {
 				defer resp.Body.Close() // It fixes an error with http
 				u := resp.Request.URL.String()
 				mutex.Lock()
-				urlRedirCache.Add(j.url, u)
+				urlRedirCache.Add(j.Url, u)
 				mutex.Unlock()
-				j.fetched = true
-				j.url = u
+				j.Fetched = true
+				j.Url = u
 				c <- j
 			}
 		}
 	}
 }
 
-func storeTweet(t *urlFetch) {
-	if val, ok := urls[t.url]; ok {
-		val.count++
-	} else {
-		urls[t.url] = &url{count: 0, created: time.Now(), url: t.url}
-	}
-}
-
 // Set twitter stream handlers
-func attachMessageHandlers(stream *twitter.Stream, c chan *urlFetch) {
+func attachMessageHandlers(stream *twitter.Stream, c chan *brain.UrlFetch) {
 	demux := twitter.NewSwitchDemux()
 
 	demux.Tweet = func(tweet *twitter.Tweet) {
 		if tweet.Entities != nil && len(tweet.Entities.Urls) != 0 {
 			for _, u := range tweet.Entities.Urls {
-				c <- NewUrlFetch(u.ExpandedURL)
+				c <- brain.NewUrlFetch(u.ExpandedURL)
 			}
 		}
 	}
@@ -161,14 +131,14 @@ func attachMessageHandlers(stream *twitter.Stream, c chan *urlFetch) {
 	go demux.HandleChan(stream.Messages)
 }
 
-func openTwitterStream() *twitter.Stream {
+func openTwitterStream(log *log.Logger) *twitter.Stream {
 	c := config.Twitter
 	oauthConfig := oauth1.NewConfig(c.ConsumerKey, c.ConsumerSecret)
 	token := oauth1.NewToken(c.AccessToken, c.AccessSecret)
 	httpClient := oauthConfig.Client(oauth1.NoContext, token)
 	client := twitter.NewClient(httpClient)
 
-	fmt.Println("Opening sample stream...")
+	log.Println("Opening sample stream...")
 	streamParams := &twitter.StreamSampleParams{
 		StallWarnings: twitter.Bool(true),
 	}
@@ -178,26 +148,4 @@ func openTwitterStream() *twitter.Stream {
 	}
 
 	return stream
-}
-
-func scoreUrls() []url {
-	urlsByScore := make([]url, 1)
-	for _, v := range urls {
-		if v.count > 1 {
-			v.CalculateScore()
-			urlsByScore = append(urlsByScore, *v)
-		}
-	}
-	return urlsByScore
-}
-
-func showCollectedData() {
-	urlsByScore := scoreUrls()
-	sort.Sort(UrlsByScore(urlsByScore))
-	for i, v := range urlsByScore {
-		if i == 100 {
-			break
-		}
-		fmt.Printf("%f %d %s\n", v.score, v.count, v.url)
-	}
 }
