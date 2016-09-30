@@ -4,7 +4,6 @@ import (
 	"fmt"
 
 	"../schema"
-	"github.com/olivere/elastic"
 	"github.com/xescugc/twitter_hot_links/config" // TODO: Check why one import works and the other no
 	//"../config"
 )
@@ -25,14 +24,4 @@ func main() {
 	}
 
 	fmt.Println("Index Created")
-}
-
-func getClient() *elastic.Client {
-	ElasticSearch, err := elastic.NewClient()
-
-	if err != nil {
-		panic(err)
-	}
-
-	return ElasticSearch
 }

@@ -10,11 +10,9 @@ import (
 	"time"
 
 	"./brain"
-	"./config"
 	"./logger"
 	"./schema"
-	"github.com/dghubble/go-twitter/twitter"
-	"github.com/dghubble/oauth1"
+	"./stream"
 	"github.com/golang/groupcache/lru"
 )
 
@@ -35,8 +33,6 @@ func main() {
 	resolverLog := logFile.WithNamespace("Resolver")
 	storeLog := logFile.WithNamespace("Store")
 
-	stream := openTwitterStream(streamLog)
-
 	tickChan := time.NewTicker(time.Minute * 1).C
 	storeChan := time.NewTicker(time.Minute * 5).C
 	signalChannel := make(chan os.Signal)
@@ -44,7 +40,10 @@ func main() {
 	jobsChannel := make(chan *brain.UrlFetch)
 	signal.Notify(signalChannel, syscall.SIGINT, syscall.SIGTERM)
 
-	attachMessageHandlers(stream, tweetChannel)
+	stream := stream.NewStream(tweetChannel, streamLog)
+	stream.Start()
+
+	//attachMessageHandlers(stream, tweetChannel)
 
 	for i := 1; i < numberOfWokers; i++ {
 		go fetchWorker(jobsChannel, tweetChannel, resolverLog)
@@ -68,7 +67,7 @@ func main() {
 		case <-signalChannel:
 			log.Println("Stoping ...")
 			stream.Stop()
-			//Ensure to save brain state
+			//TODO: Ensure to save brain state
 			close(tweetChannel)
 			return
 		}
@@ -114,38 +113,4 @@ func fetchWorker(jobs <-chan *brain.UrlFetch, c chan<- *brain.UrlFetch, log *log
 			}
 		}
 	}
-}
-
-// Set twitter stream handlers
-func attachMessageHandlers(stream *twitter.Stream, c chan *brain.UrlFetch) {
-	demux := twitter.NewSwitchDemux()
-
-	demux.Tweet = func(tweet *twitter.Tweet) {
-		if tweet.Entities != nil && len(tweet.Entities.Urls) != 0 {
-			for _, u := range tweet.Entities.Urls {
-				c <- brain.NewUrlFetch(u.ExpandedURL)
-			}
-		}
-	}
-
-	go demux.HandleChan(stream.Messages)
-}
-
-func openTwitterStream(log *log.Logger) *twitter.Stream {
-	c := config.Twitter
-	oauthConfig := oauth1.NewConfig(c.ConsumerKey, c.ConsumerSecret)
-	token := oauth1.NewToken(c.AccessToken, c.AccessSecret)
-	httpClient := oauthConfig.Client(oauth1.NoContext, token)
-	client := twitter.NewClient(httpClient)
-
-	log.Println("Opening sample stream...")
-	streamParams := &twitter.StreamSampleParams{
-		StallWarnings: twitter.Bool(true),
-	}
-	stream, err := client.Streams.Sample(streamParams)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	return stream
 }
