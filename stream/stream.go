@@ -5,8 +5,8 @@ import (
 
 	"../brain"
 	"../config"
+	"github.com/dghubble/go-twitter/twitter"
 	"github.com/dghubble/oauth1"
-	"github.com/xescugc/go-twitter/twitter"
 )
 
 type stream struct {
