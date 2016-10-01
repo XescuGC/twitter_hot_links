@@ -100,7 +100,7 @@ func fetchWorker(jobs <-chan *brain.UrlFetch, c chan<- *brain.UrlFetch, log *log
 		} else {
 			resp, err := httpClient.Get(j.Url)
 			if err != nil {
-				log.Printf("%v\n", err.Error())
+				log.Printf("%v for %#v\n", err.Error(), j)
 			} else {
 				defer resp.Body.Close() // It fixes an error with http
 				u := resp.Request.URL.String()

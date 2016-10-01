@@ -28,7 +28,9 @@ func (s *stream) Start() {
 	demux.Tweet = func(tweet *twitter.Tweet) {
 		if tweet.Entities != nil && len(tweet.Entities.Urls) != 0 {
 			for _, u := range tweet.Entities.Urls {
-				s.c <- brain.NewUrlFetch(u.ExpandedURL)
+				if len(u.ExpandedURL) > 0 {
+					s.c <- brain.NewUrlFetch(u.ExpandedURL)
+				}
 			}
 		}
 	}
